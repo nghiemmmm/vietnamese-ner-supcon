@@ -1,14 +1,13 @@
-from .base import SupConOutput, LinearProbeOutput
+from .base import NerOutput
 from .projection import ProjectionHead
-from .losses import TokenSupConLoss
-from .linear_probe import PhoBertSupCon, PhoBertLinearProbe
+from .losses import HierarchicalTokenSupConLoss
+from .linear_probe import PhoBertSupConPretrainer, PhoBertLinearProbe
 
 __all__ = [
-    'SupConOutput',
-    'LinearProbeOutput',
+    'NerOutput',
     'ProjectionHead',
-    'TokenSupConLoss',
-    'PhoBertSupCon',
+    'HierarchicalTokenSupConLoss',
+    'PhoBertSupConPretrainer',
     'PhoBertLinearProbe'
 ]
 

@@ -1,48 +1,33 @@
 #!/bin/bash
-# ==============================================================================
-# Script tự động chạy Giao thức Linear Evaluation Protocol (Stage 1 -> Stage 2)
-# Chuẩn Google SupContrast 100% (KHÔNG CÓ ALPHA)
-# ==============================================================================
-
 set -e
 
-DATA_DIR="../Dataset"
-MODEL_NAME="trungbb8/distilphobert"
-OUTPUT_DIR="outputs"
-
 echo "======================================================================"
-echo "🚀 BẮT ĐẦU CHẠY LINEAR EVALUATION PROTOCOL CHO PAP_NER (GOOGLE SUPCON 100%)"
+echo "  CHẠY THỰC NGHIỆM: TWO-STAGE H-SUPCON + LINEAR PROBE (NO CRF)"
+echo "  Backbone: PhoBERT-base | Alpha: 0.3 | Seed: 42"
 echo "======================================================================"
 
-# Giai đoạn 1: Pure Contrastive Pretraining (Google SupContrast)
-echo ">>> [BƯỚC 1/2] Huấn luyện Giai đoạn 1: Pure SupCon..."
-python main.py stage1_supcon \
-    --data_dir "$DATA_DIR" \
-    --model_name_or_path "$MODEL_NAME" \
-    --output_dir "$OUTPUT_DIR/stage1_supcon" \
-    --batch_size 64 \
-    --learning_rate 2e-5 \
-    --head_learning_rate 5e-4 \
+python main.py \
+    --task pap_ner \
+    --data_dir ./Dataset \
+    --model_name_or_path vinai/phobert-base \
+    --output_dir outputs/phobert_base_hsupcon_linear_eval \
+    --stage1_epochs 15 \
+    --stage1_batch_size 64 \
+    --stage1_lr 2e-5 \
+    --stage1_proj_lr 1e-3 \
     --supcon_temp 0.07 \
-    --epochs 15 \
-    --early_stop 5 \
-    --fp16
-
-# Giai đoạn 2: Linear Probing Evaluation
-echo ">>> [BƯỚC 2/2] Huấn luyện Giai đoạn 2: Linear Probe (Freeze Backbone, NO CRF)..."
-python main.py stage2_linear \
-    --data_dir "$DATA_DIR" \
-    --model_name_or_path "$MODEL_NAME" \
-    --pretrained_encoder_path "$OUTPUT_DIR/stage1_supcon/best_encoder.pt" \
-    --output_dir "$OUTPUT_DIR/stage2_linear" \
-    --batch_size 64 \
-    --classifier_learning_rate 1e-3 \
-    --epochs 20 \
-    --early_stop 5 \
-    --freeze_backbone \
+    --supcon_alpha 0.3 \
+    --proj_dim 128 \
+    --stage1_early_stop 5 \
+    --stage2_epochs 20 \
+    --stage2_batch_size 64 \
+    --stage2_lr 1e-3 \
+    --stage2_early_stop 5 \
+    --seed 42 \
     --fp16
 
 echo "======================================================================"
-echo "✅ HOÀN THÀNH TOÀN BỘ GIAO THỨC LINEAR EVALUATION PROTOCOL!"
-echo "Kết quả lưu tại: $OUTPUT_DIR/stage2_linear/"
+echo "  HOÀN TẤT THỰC NGHIỆM! KIỂM TRA LOG TẠI:"
+echo "  outputs/phobert_base_hsupcon_linear_eval/training.log"
 echo "======================================================================"
+

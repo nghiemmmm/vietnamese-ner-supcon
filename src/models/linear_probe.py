@@ -1,154 +1,123 @@
-import os
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoConfig, logging
+from transformers import AutoModel, AutoConfig
+
+from .base import NerOutput
 from .projection import ProjectionHead
-from .losses import TokenSupConLoss
-from .base import SupConOutput, LinearProbeOutput
-
-logging.set_verbosity_error()
+from .losses import HierarchicalTokenSupConLoss
 
 
-class PhoBertSupCon(nn.Module):
+class PhoBertSupConPretrainer(nn.Module):
     """
-    Stage 1 Model: PhoBERT Backbone + Projection Head for Pure Contrastive Pre-training.
-    Optimizes representation space via TokenSupConLoss (Google SupContrast 100% - NO ALPHA).
-    Supports loading directly from a pre-trained model identifier (e.g. 'trungbb8/distilphobert')
-    or from a pre-loaded RobertaConfig.
+    GIAI ĐOẠN 1: Pre-training PhoBERT bằng Hierarchical Token-level Contrastive Loss.
+    
+    Cấu trúc:
+      Input Tokens -> PhoBERT Backbone -> valid_ids alignment -> ProjectionHead -> H-SupCon Loss
     """
-    def __init__(self, model_name_or_config, projection_dim: int = 128, temperature: float = 0.07, o_label_id: int = 0):
-        super(PhoBertSupCon, self).__init__()
-        if isinstance(model_name_or_config, str):
-            self.config = AutoConfig.from_pretrained(model_name_or_config)
-            self.roberta = AutoModel.from_pretrained(model_name_or_config, config=self.config)
-        else:
-            self.config = model_name_or_config
-            self.roberta = AutoModel.from_config(self.config)
-
-        self.projection_head = ProjectionHead(
-            input_dim=self.config.hidden_size,
-            hidden_dim=256,
-            output_dim=projection_dim
-        )
-        self.supcon_loss = TokenSupConLoss(temperature=temperature)
+    def __init__(self, model_name_or_path: str = 'vinai/phobert-base',
+                 proj_dim: int = 128,
+                 temperature: float = 0.07,
+                 alpha: float = 0.3,
+                 o_label_id: int = 0):
+        super(PhoBertSupConPretrainer, self).__init__()
+        self.config = AutoConfig.from_pretrained(model_name_or_path)
+        self.roberta = AutoModel.from_pretrained(model_name_or_path, config=self.config)
+        self.projection_head = ProjectionHead(input_dim=self.config.hidden_size, hidden_dim=256, output_dim=proj_dim)
+        self.supcon_loss = HierarchicalTokenSupConLoss(temperature=temperature, alpha=alpha)
         self.o_label_id = o_label_id
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
-                labels=None, valid_ids=None, label_masks=None):
-        # 1. PhoBERT contextual representations
+                labels=None, valid_ids=None, label_masks=None, **kwargs):
+        # 1. Biểu diễn ngữ cảnh từ PhoBERT
         outputs = self.roberta(
             input_ids=input_ids,
             token_type_ids=token_type_ids,
             attention_mask=attention_mask
         )
-        seq_outputs = outputs[0]  # [B, max_len, hidden_dim]
+        seq_output = outputs[0]  # [B, max_len, 768]
 
-        # 2. Subword alignment to original Vietnamese words via valid_ids
-        batch_size = seq_outputs.size(0)
-        range_vector = torch.arange(0, batch_size, dtype=torch.long, device=seq_outputs.device).unsqueeze(1)
-        word_representations = seq_outputs[range_vector, valid_ids]  # [B, max_words, 768]
+        # 2. Gióng hàng subword để lấy biểu diễn cấp từ (word-level representations)
+        batch_size, max_len, feat_dim = seq_output.shape
+        range_vector = torch.arange(0, batch_size, dtype=torch.long, device=seq_output.device).unsqueeze(1)
+        word_representations = seq_output[range_vector, valid_ids]  # [B, max_words, 768]
 
-        # 3. Filter valid entity tokens (exclude padding and background 'O')
+        # 3. Lọc riêng các token thực thể (loại bỏ nhãn 'O' và padding)
         valid_entity_mask = (label_masks != 0) & (labels != self.o_label_id)
-        num_valid = valid_entity_mask.sum().item()
+        if not valid_entity_mask.any():
+            zero_loss = seq_output.sum() * 0.0
+            return NerOutput(loss=zero_loss, loss_supcon=zero_loss)
 
-        if num_valid < 2 or labels is None:
-            return SupConOutput(loss=seq_outputs.new_tensor(0.0), num_valid_anchors=num_valid)
+        entity_words = word_representations[valid_entity_mask]  # [N_entity, 768]
+        entity_labels = labels[valid_entity_mask]                # [N_entity]
 
-        # 4. Project entity token representations to hypersphere S^127
-        entity_feats = self.projection_head(word_representations)[valid_entity_mask]
-        entity_tags = labels[valid_entity_mask]
+        # 4. Chiếu qua Projection Head và tính H-SupCon Loss
+        entity_projections = self.projection_head(entity_words)  # [N_entity, 128]
+        loss = self.supcon_loss(entity_projections, entity_labels)
 
-        # 5. Compute TokenSupConLoss (Vanilla Google SupContrast)
-        loss = self.supcon_loss(entity_feats, entity_tags)
-        return SupConOutput(loss=loss, num_valid_anchors=num_valid)
+        return NerOutput(loss=loss, loss_supcon=loss)
 
 
 class PhoBertLinearProbe(nn.Module):
     """
-    Stage 2 Model: Linear Probing Evaluation Protocol (Google SupContrast style).
-    - Encoder Backbone: Loaded from Stage 1 checkpoint and FROZEN (torch.no_grad() / requires_grad=False).
-    - Classifier: Single Linear layer (nn.Linear(768, num_labels)).
-    - Objective: Standard Cross-Entropy Loss with ignore_index=-100.
-    - Inference: Argmax per token (NO CRF, NO Viterbi decoding).
+    GIAI ĐOẠN 2: Linear Probe trên Backbone ĐÓNG BĂNG 100% (KHÔNG DÙNG CRF).
+    
+    Cấu trúc:
+      Input Tokens -> PhoBERT (requires_grad = False) -> valid_ids alignment -> nn.Linear(768, num_labels) -> Cross-Entropy
+      Suy luận: argmax(logits, dim=-1)
     """
-    def __init__(self, model_name_or_config, num_labels: int = 11, freeze_backbone: bool = True):
+    def __init__(self, model_name_or_path: str = 'vinai/phobert-base',
+                 num_labels: int = 11,
+                 freeze_backbone: bool = True):
         super(PhoBertLinearProbe, self).__init__()
-        if isinstance(model_name_or_config, str):
-            self.config = AutoConfig.from_pretrained(model_name_or_config)
-            self.roberta = AutoModel.from_pretrained(model_name_or_config, config=self.config)
-        else:
-            self.config = model_name_or_config
-            self.roberta = AutoModel.from_config(self.config)
-
+        self.config = AutoConfig.from_pretrained(model_name_or_path)
         self.num_labels = num_labels
-        self.freeze_backbone = freeze_backbone
+        self.roberta = AutoModel.from_pretrained(model_name_or_path, config=self.config)
+
+        # ĐÓNG BĂNG HOÀN TOÀN BACKBONE THEO CHUẨN GOOGLE LINEAR EVALUATION
+        if freeze_backbone:
+            for param in self.roberta.parameters():
+                param.requires_grad = False
 
         self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
         self.classifier = nn.Linear(self.config.hidden_size, num_labels)
-        self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-
-        if self.freeze_backbone:
-            self._freeze_encoder()
-
-    def _freeze_encoder(self):
-        """Freezes all parameters of the Transformer encoder."""
-        for param in self.roberta.parameters():
-            param.requires_grad = False
-
-    def unfreeze_encoder(self):
-        """Optional helper to unfreeze encoder for end-to-end fine-tuning."""
-        for param in self.roberta.parameters():
-            param.requires_grad = True
-        self.freeze_backbone = False
+        self.loss_fn = nn.CrossEntropyLoss(reduction='none')
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None,
-                labels=None, valid_ids=None, label_masks=None):
-        batch_size = input_ids.size(0)
-        range_vector = torch.arange(0, batch_size, dtype=torch.long, device=input_ids.device).unsqueeze(1)
-
-        # 1. Forward through frozen backbone
-        if self.freeze_backbone:
-            with torch.no_grad():
-                outputs = self.roberta(
-                    input_ids=input_ids,
-                    token_type_ids=token_type_ids,
-                    attention_mask=attention_mask
-                )
-                seq_outputs = outputs[0]
-                word_representations = seq_outputs[range_vector, valid_ids]
-        else:
+                labels=None, valid_ids=None, label_masks=None, **kwargs):
+        # 1. Trích xuất đặc trưng với backbone đã đóng băng
+        with torch.set_grad_enabled(not all(not p.requires_grad for p in self.roberta.parameters())):
             outputs = self.roberta(
                 input_ids=input_ids,
                 token_type_ids=token_type_ids,
                 attention_mask=attention_mask
             )
-            seq_outputs = outputs[0]
-            word_representations = seq_outputs[range_vector, valid_ids]
+            seq_output = outputs[0]
 
-        # 2. Linear classifier emission
-        rep_dropped = self.dropout(word_representations)
-        logits = self.classifier(rep_dropped)  # [B, max_words, num_labels]
+        # 2. Gióng hàng subword
+        batch_size, max_len, feat_dim = seq_output.shape
+        range_vector = torch.arange(0, batch_size, dtype=torch.long, device=seq_output.device).unsqueeze(1)
+        word_representations = seq_output[range_vector, valid_ids]
 
-        # 3. Predict tag sequences via Argmax (No CRF)
-        active_mask = (label_masks != 0)
-        preds = torch.argmax(logits, dim=-1)
+        # 3. Phân loại tuyến tính (Linear Classifier)
+        word_representations = self.dropout(word_representations)
+        logits = self.classifier(word_representations)  # [B, max_words, num_labels]
 
-        seq_tags = []
+        # 4. Dự đoán nhãn độc lập từng token (KHÔNG CÓ CRF)
+        preds = torch.argmax(logits, dim=-1)  # [B, max_words]
+
+        # Tách danh sách nhãn dự đoán theo từng câu dựa trên mask
+        tags = []
         for b in range(batch_size):
-            length = active_mask[b].sum().item()
-            seq_tags.append(preds[b, :length].cpu().tolist())
+            active_len = label_masks[b].sum().item()
+            tags.append(preds[b, :active_len].cpu().tolist())
 
-        # 4. Cross-Entropy Loss computation
+        # 5. Tính hàm mất mát Cross-Entropy (chỉ tính trên các vị trí token hợp lệ)
         loss = None
         if labels is not None:
-            active_loss = active_mask.view(-1)
-            active_logits = logits.view(-1, self.num_labels)
-            active_labels = torch.where(
-                active_loss,
-                labels.view(-1),
-                torch.tensor(-100, dtype=torch.long, device=labels.device)
-            )
-            loss = self.loss_fct(active_logits, active_labels)
+            active_loss = label_masks.view(-1) == 1
+            active_logits = logits.view(-1, self.num_labels)[active_loss]
+            active_labels = labels.view(-1)[active_loss]
+            loss = self.loss_fn(active_logits, active_labels).mean()
 
-        return LinearProbeOutput(loss=loss, logits=logits, tags=seq_tags)
+        return NerOutput(loss=loss, logits=logits, tags=tags, loss_ce=loss)
+

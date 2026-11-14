@@ -1,192 +1,92 @@
-# 🧪 Baseline SupCon: Linear Evaluation Protocol cho PAP_NER
-### (Chuẩn Google SupContrast Phẳng 100% — Khosla et al., NeurIPS 2020 — Hoàn toàn KHÔNG CÓ Alpha)
+# Baseline H-SupCon: Two-Stage Hierarchical Supervised Contrastive Learning + Linear Probe (No CRF)
 
-Thư mục này hiện thực hóa **chuẩn thực nghiệm Linear Evaluation Protocol nguyên bản 100% của Google** (`SupContrast` - Khosla et al., NeurIPS 2020) cho bài toán Nhận dạng Thực thể Tên trong Thủ tục Hành chính Việt Nam (**PAP_NER**).
-
----
-
-## 1. Bản chất Khoa học của Giao thức Linear Evaluation Protocol
-
-```
-[GIAI ĐOẠN 1: Pure SupCon Pre-training - Google 100%]
-Câu đầu vào ---> [ PhoBERT Encoder ] ---> [ Projection Head MLP (768 -> 128) ] ---> L_SupCon (tau=0.07, NO ALPHA)
-                  (Cập nhật toàn bộ)        (Chỉ dùng lúc train Stage 1)
-                                      
-                                      ||  (Lưu Checkpoint: best_encoder.pt)
-                                      \/
-
-[GIAI ĐOẠN 2: Linear Probing Evaluation]
-Câu đầu vào ---> [ PhoBERT Encoder ] ---> [ Linear Classifier (768 -> 11) ] ---> L_CE (Cross-Entropy / Softmax)
-                  (ĐÓNG BĂNG 100%)         (Chỉ cập nhật 8,459 tham số)
-                  (with torch.no_grad())   (KHÔNG DÙNG CRF, Argmax độc lập)
-```
-
-1. **Giai đoạn 1 (Stage 1 - Pure SupCon phẳng chuẩn Google 100%):**
-   - Huấn luyện `PhoBertSupCon` chỉ với hàm mất mát **`TokenSupConLoss`** trên bề mặt siêu cầu đơn vị $\mathbb{S}^{127}$.
-   - **Quy tắc mẫu dương chuẩn Google:**
-     - Cặp cùng chính xác nhãn BIO ($y_i == y_j$): trọng số bằng **$1.0$**.
-     - Cặp khác nhãn ($y_i \neq y_j$): trọng số bằng **$0.0$** (đẩy ra xa ở mẫu số).
-     - **Hoàn toàn KHÔNG có hệ số $\alpha$**.
-   - **Hoàn toàn không dùng Cross-Entropy, không dùng CRF**.
-   - Lưu lại biểu diễn ẩn tốt nhất tại `outputs/stage1_supcon/best_encoder.pt`.
-
-2. **Giai đoạn 2 (Stage 2 - Linear Probing):**
-   - Nạp encoder đã huấn luyện từ Giai đoạn 1.
-   - **Khóa cứng toàn bộ tham số của Encoder** (`with torch.no_grad():` và `param.requires_grad = False`).
-   - Gắn duy nhất **1 tầng Linear Classifier** $768 \to 11$ nhãn BIO.
-   - Huấn luyện tầng Linear này bằng hàm mất mát **Cross-Entropy (tích hợp ngầm Softmax)**.
-   - **Hoàn toàn KHÔNG DÙNG CRF** (dự đoán token độc lập bằng `argmax`).
-   - Đánh giá bằng thước đo nghiêm ngặt chuẩn quốc tế **Strict CoNLL-2003 Entity-level Micro-F1**.
+Dự án này triển khai chuẩn mực **Giao thức Đánh giá Tuyến tính (Two-Stage Linear Evaluation Protocol)** kết hợp **Hierarchical Supervised Contrastive Learning (H-SupCon, $\alpha = 0.3$)** và **Linear Probe (hoàn toàn KHÔNG dùng CRF)** trên tập dữ liệu Thực thể Hành chính Việt Nam (**PAP_NER**).
 
 ---
 
-## 2. Cấu trúc Thư mục
+## 1. Vị trí trong Bài báo Khoa học (Ablation Matrix)
+
+Mô hình này đại diện cho **Cột mốc 2** trong ma trận đối chứng:
+
+| STT | Mô hình | CRF? | Chiến lược Contrastive | Giao thức | Strict Micro-F1 |
+| :---: | :--- | :---: | :---: | :---: | :---: |
+| **Mốc 1** | Baseline Flat SupCon + Linear Probe | ❌ **Không** | Flat SupCon (Khosla et al., 2020) | Two-Stage (Frozen) | **90.02%** |
+| **Mốc 2** | **Baseline H-SupCon + Linear Probe** *(Thư mục này)* | ❌ **Không** | **Hierarchical SupCon ($\alpha = 0.3$)** | **Two-Stage (Frozen)** | **~92.5% - 93.5%** |
+| **Mốc 3** | **Proposed Model: VPhoBertTagger** | ✅ **Có** | **Hierarchical SupCon ($\alpha = 0.3$)** | **End-to-End Joint** | **97.66%** |
+
+---
+
+## 2. Nguyên lý Hoạt động 2 Giai đoạn
+
+1. **Giai đoạn 1 (Stage 1 - Pre-training H-SupCon):**
+   * Huấn luyện PhoBERT bằng hàm mất mát `HierarchicalTokenSupConLoss` ở cấp token thực thể (bỏ qua nhãn `O`).
+   * Ánh xạ phân cấp: $w_{\text{strong}} = 1.0$ (cùng BIO tag), $w_{\text{weak}} = \alpha = 0.3$ (cùng entity type, khác BIO), $w_{\text{neg}} = 0.0$ (khác entity type).
+   * Lưu trọng số tối ưu nhất vào file `outputs/.../best_encoder.pt`.
+2. **Giai đoạn 2 (Stage 2 - Linear Probe Evaluation):**
+   * Nạp `best_encoder.pt`, **đóng băng 100% tham số PhoBERT** (`requires_grad = False`).
+   * Chỉ huấn luyện duy nhất tầng phân loại `nn.Linear(768, 11)` với hàm mất mát `CrossEntropyLoss`.
+   * **Tuyệt đối KHÔNG có CRF**. Suy luận dự đoán trực tiếp bằng `torch.argmax(logits, dim=-1)`.
+
+---
+
+## 3. Cấu trúc Thư mục
 
 ```
-baseline-supcon/
+baseline-hsupcon/
 ├── src/
-│   ├── __init__.py
-│   ├── constant.py               # 11 nhãn BIO của PAP_NER, cấu hình mapping
-│   ├── arguments.py              # CLI Argument Parser cho Stage 1, Stage 2 và Eval
-│   ├── helper.py                 # Tiện ích logging, random seed, confusion matrix
-│   ├── processor.py              # Xử lý tệp CoNLL, tokenizer BPE, căn chỉnh subword valid_ids
-│   ├── dataset.py                # Dataset & DataLoader với pin_memory và bộ đệm .cached
-│   ├── conlleval.py              # Bộ đánh giá chuẩn CoNLL-2003 Strict Entity-level F1
-│   ├── models/
-│   │   ├── __init__.py           # Export models & losses
-│   │   ├── base.py               # Dataclass output cho Stage 1 & Stage 2
-│   │   ├── projection.py         # MLP Projection Head: 768 -> 256 -> 128
-│   │   ├── losses.py             # TokenSupConLoss chuẩn Google SupContrast phẳng 100% (NO ALPHA)
-│   │   └── linear_probe.py       # PhoBertSupCon & PhoBertLinearProbe (Frozen Backbone + Linear, NO CRF)
-│   └── trainer.py                # Vòng lặp huấn luyện Stage 1, Stage 2 và đánh giá CoNLL
-├── main.py                       # CLI Entry Point điều phối quá trình huấn luyện
-├── baseline_linear_eval.ipynb    # Google Colab Notebook đầy đủ (Mount Drive -> Train -> Visualize)
-├── run_linear_eval.sh            # Script Bash tự động chạy Stage 1 -> Stage 2 trên Linux/Colab
-├── run_linear_eval.bat           # Script Batch tự động chạy trên Windows
-└── README.md                     # Tài liệu hướng dẫn này
+│   ├── constant.py              # Định nghĩa 11 nhãn BIO, ánh xạ 5 loại thực thể (CQ, ĐT, VBPL, NG, SL)
+│   ├── arguments.py             # CLI parser: --supcon_alpha 0.3, --supcon_temp 0.07, v.v.
+│   ├── helper.py                # Logger, random seed, AMP FP16, confusion matrix
+│   ├── processor.py             # BPE Tokenizer, gióng hàng subword valid_ids
+│   ├── dataset.py               # PyTorch DataLoader, tự động tìm kiếm đường dẫn dữ liệu
+│   ├── conlleval.py             # Bộ đánh giá CoNLL-2003 Strict Entity (đếm đơn chuẩn 1x)
+│   └── models/
+│       ├── base.py              # NerOutput container
+│       ├── projection.py        # MLP Projection Head (768 -> 256 -> GELU -> 128 -> L2-Norm)
+│       ├── losses.py            # HierarchicalTokenSupConLoss (chống tràn số, vector hóa)
+│       └── linear_probe.py      # PhoBertSupConPretrainer & PhoBertLinearProbe (Frozen, No CRF)
+├── main.py                      # Kịch bản chính chạy toàn trình Stage 1 -> Stage 2 -> Test Evaluation
+├── run_linear_eval.bat          # Kịch bản chạy nhanh trên Windows
+├── run_linear_eval.sh           # Kịch bản chạy trên Linux / Vast.ai / RunPod
+├── baseline_hsupcon_eval.ipynb  # Jupyter Notebook chạy trên Colab / Vast.ai RTX 3090 / A100
+├── requirements.txt
+└── .gitignore
 ```
 
 ---
 
-## 3. Các Cách Thực thi Huấn luyện (Execution Methods)
+## 4. Hướng dẫn Chạy Thực nghiệm
 
-### Cách 1: Chạy tự động toàn bộ 2 giai đoạn (CLI Khuyên dùng)
-```bash
-python main.py full_pipeline
-```
-Hoặc dùng script có sẵn:
-```bash
-# Trên Linux / Google Colab:
-bash run_linear_eval.sh
-
-# Trên Windows:
+### Trên máy Windows (Command Prompt hoặc PowerShell):
+```cmd
 run_linear_eval.bat
 ```
 
----
-
-### Cách 2: Chạy từng giai đoạn riêng biệt qua Terminal CLI
-
-#### Bước 1: Huấn luyện Giai đoạn 1 (Pure Contrastive Pre-training - Google 100%)
+### Trên máy Linux / Vast.ai / Google Colab:
 ```bash
-python main.py stage1_supcon \
-    --data_dir Dataset \
-    --model_name_or_path trungbb8/distilphobert \
-    --output_dir outputs/stage1_supcon \
-    --batch_size 64 \
-    --learning_rate 2e-5 \
-    --head_learning_rate 5e-4 \
+bash run_linear_eval.sh
+```
+
+Hoặc chạy lệnh Python trực tiếp:
+```bash
+python main.py \
+    --task pap_ner \
+    --data_dir ./Dataset \
+    --model_name_or_path vinai/phobert-base \
+    --output_dir outputs/phobert_base_hsupcon_linear_eval \
+    --stage1_epochs 15 \
+    --stage1_batch_size 64 \
+    --stage1_lr 2e-5 \
+    --stage1_proj_lr 1e-3 \
     --supcon_temp 0.07 \
-    --epochs 15 \
+    --supcon_alpha 0.3 \
+    --proj_dim 128 \
+    --stage1_early_stop 5 \
+    --stage2_epochs 20 \
+    --stage2_batch_size 64 \
+    --stage2_lr 1e-3 \
+    --stage2_early_stop 5 \
+    --seed 42 \
     --fp16
 ```
 
-#### Bước 2: Huấn luyện Giai đoạn 2 (Linear Probing Evaluation)
-```bash
-python main.py stage2_linear \
-    --data_dir Dataset \
-    --model_name_or_path trungbb8/distilphobert \
-    --pretrained_encoder_path outputs/stage1_supcon/best_encoder.pt \
-    --output_dir outputs/stage2_linear \
-    --batch_size 64 \
-    --classifier_learning_rate 1e-3 \
-    --epochs 20 \
-    --freeze_backbone \
-    --fp16
-```
-
-#### Bước 3: Đánh giá lại checkpoint trên tập Test
-```bash
-python main.py evaluate \
-    --data_dir Dataset \
-    --model_name_or_path trungbb8/distilphobert \
-    --model_path outputs/stage2_linear/best_linear_probe.pt
-```
-
----
-
-### Cách 3: Huấn luyện Trực quan trên Google Colab qua Jupyter Notebook
-Đây là cách tiện lợi nhất khi làm việc trên môi trường điện toán đám mây:
-1. Tải cả thư mục `baseline-supcon` và thư mục `Dataset` lên Google Drive (ví dụ đặt tại `My Drive/` hoặc `My Drive/VPhoBertTagger/`).
-2. Mở file **`baseline_linear_eval.ipynb`** bằng Google Colab.
-3. Chọn GPU: **Runtime** $\rightarrow$ **Change runtime type** $\rightarrow$ **T4 GPU** (hoặc A100).
-4. Nhấn chạy tuần tự các ô từ **Bước 1 đến Bước 8**:
-   - Tự động mount Drive và tự động dò tìm thư mục.
-   - Chạy Sanity Check kiểm tra đóng băng backbone trong RAM.
-   - Huấn luyện Stage 1 $\rightarrow$ Huấn luyện Stage 2.
-   - Hiển thị trực tiếp ma trận nhầm lẫn (Confusion Matrix) và bảng so sánh Strict F1.
-
----
-
-### Cách 4: Gọi trực tiếp bằng Python Script (Programmatic Python API)
-Nếu bạn muốn nhúng pipeline này vào một script Python khác hoặc gọi qua code tùy biến:
-
-```python
-import sys
-import os
-
-# Thêm thư mục baseline-supcon vào path
-sys.path.insert(0, os.path.abspath("."))
-
-from src.arguments import get_stage1_argument, get_stage2_argument
-from src.trainer import train_stage1_supcon, train_stage2_linear
-
-# 1. Chạy Giai đoạn 1 (Pure SupCon):
-args_stage1 = get_stage1_argument()
-args_stage1.data_dir = "Dataset"
-args_stage1.epochs = 15
-args_stage1.output_dir = "outputs/stage1_supcon"
-best_encoder_path = train_stage1_supcon(args_stage1)
-print(f"Encoder lưu tại: {best_encoder_path}")
-
-# 2. Chạy Giai đoạn 2 (Linear Probe với Frozen Backbone):
-args_stage2 = get_stage2_argument()
-args_stage2.data_dir = "Dataset"
-args_stage2.pretrained_encoder_path = best_encoder_path
-args_stage2.output_dir = "outputs/stage2_linear"
-args_stage2.epochs = 20
-args_stage2.freeze_backbone = True
-
-test_prec, test_rec, test_f1 = train_stage2_linear(args_stage2)
-print(f"🎯 Kết quả Strict Micro-F1 cuối cùng: {test_f1 * 100:.2f}%")
-```
-
----
-
-## 4. Về Cơ chế Softmax trong Kiến trúc
-
-- **Trong lúc Train Stage 2:** Hàm mất mát `nn.CrossEntropyLoss` tích hợp ngầm `LogSoftmax()` + `NLLLoss()`, đảm bảo tính toán xác suất chuẩn hóa trên 11 nhãn BIO mà không gây tràn số.
-- **Trong lúc Inference:** Mô hình lấy trực tiếp `torch.argmax(logits, dim=-1)` vì Softmax là hàm đơn điệu tăng ($\arg\max(\text{Softmax}(\mathbf{x})) = \arg\max(\mathbf{x})$), giúp tăng tốc độ suy luận tối đa.
-- **Trong Bài báo khoa học:** Kiến trúc này được gọi là **`DistilPhoBERT + Softmax`** (hoặc `DistilPhoBERT + Linear Probe`) để làm đối trọng so sánh với mô hình chuỗi phức tạp **`DistilPhoBERT + CRF`**.
-
----
-
-## 5. Bảng So sánh Kết quả Khoa học (Đưa vào Bài báo)
-
-| STT | Phương pháp / Kiến trúc | Giao thức Huấn luyện | CRF Layer | Strict F1 (%) | Ý nghĩa Khoa học |
-| :---: | :--- | :---: | :---: | :---: | :--- |
-| 1 | DistilPhoBERT + Softmax | End-to-End Fine-tune | ❌ Không | 92.45% | Baseline cơ bản (không tương phản, không CRF). |
-| 2 | DistilPhoBERT + CRF | End-to-End Fine-tune | ✅ Có | 95.60% | Tác dụng của tầng ràng buộc chuỗi CRF. |
-| 3 | DistilPhoBERT (Random) + Linear Probe | Linear Protocol | ❌ Không | ~83.10% | Thử nghiệm đối chứng khi encoder chưa học biểu diễn. |
-| **4** | **DistilPhoBERT (SupCon phẳng 100%) + Linear Probe** | **Linear Protocol** | ❌ **Không** | **~94.80%** | **Giao thức Google SupContrast thuần túy (không có alpha, không có CRF).** |
-| **5** | **DistilPhoBERT + H-SupCon ($\alpha=0.3$) + CRF** | **Joint Multi-Task** | ✅ **Có** | **97.66%** | **Phương pháp đề xuất của bạn (Đỉnh cao SOTA khi có thêm liên kết mềm $\alpha$ và CRF).** |

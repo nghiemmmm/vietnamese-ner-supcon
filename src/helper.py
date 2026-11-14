@@ -1,103 +1,119 @@
 import os
 import random
 import logging
-import argparse
-from typing import List, Optional
+import datetime
+from contextlib import nullcontext
+from typing import List
 
 import torch
 import numpy as np
-
-# Safe globals for PyTorch 2.6+
-if hasattr(torch.serialization, 'add_safe_globals'):
-    try:
-        torch.serialization.add_safe_globals([argparse.Namespace])
-    except Exception:
-        pass
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix
 
 
-def safe_torch_load(f, map_location=None, **kwargs):
-    """Safely loads torch files supporting PyTorch 2.6+ where weights_only defaults to True."""
-    try:
-        return torch.load(f, map_location=map_location, weights_only=False, **kwargs)
-    except TypeError:
-        return torch.load(f, map_location=map_location, **kwargs)
+def init_logger(log_file: str = None) -> logging.Logger:
+    """Khởi tạo logger đồng thời ghi ra màn hình console và file log."""
+    logger = logging.getLogger("baseline_hsupcon")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # File handler (nếu có)
+    if log_file:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)), exist_ok=True)
+        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
 
 
 def set_random_seed(seed: int = 42):
+    """Cố định seed để tái lập hoàn toàn kết quả thực nghiệm."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
-def init_logger(log_file: Optional[str] = None, log_file_level=logging.INFO):
-    log_format = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    logger = logging.getLogger("baseline_supcon")
-    logger.setLevel(logging.INFO)
+def _get_amp_context(use_amp: bool, device: torch.device):
+    """Context manager an toàn cho Mixed Precision FP16 tương thích mọi phiên bản PyTorch."""
+    if not use_amp or not str(device).startswith('cuda'):
+        return nullcontext()
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'autocast'):
+        return torch.amp.autocast('cuda')
+    return torch.cuda.amp.autocast()
 
-    if not logger.handlers:
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(log_format)
-        logger.addHandler(console_handler)
 
-    if log_file:
-        try:
-            log_dir = './logs'
-            os.makedirs(log_dir, exist_ok=True)
-            log_path = os.path.join(log_dir, log_file)
-            file_handler = logging.FileHandler(log_path, encoding='utf-8')
-            file_handler.setLevel(log_file_level)
-            file_handler.setFormatter(log_format)
-            logger.addHandler(file_handler)
-        except Exception as e:
-            logger.warning(f"Could not initialize file logging: {e}")
-    return logger
+def _get_grad_scaler(use_amp: bool, device: torch.device):
+    """GradScaler an toàn cho Mixed Precision FP16."""
+    if not use_amp or not str(device).startswith('cuda'):
+        return None
+    if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+        return torch.amp.GradScaler('cuda')
+    return torch.cuda.amp.GradScaler()
 
 
 def get_total_model_parameters(model: torch.nn.Module):
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return total_params, trainable_params
+    """Đếm tổng số tham số và số tham số có thể cập nhật (trainable)."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 
-def plot_confusion_matrix(golds: List[int], preds: List[int], classes: List[str],
-                          output_dir: str = './outputs', title: str = 'Confusion Matrix',
-                          normalize: bool = True):
+def safe_torch_load(path: str, map_location='cpu'):
+    """Tải trọng số PyTorch an toàn tương thích PyTorch 2.6+."""
     try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-        from sklearn.metrics import confusion_matrix
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except Exception:
+        return torch.load(path, map_location=map_location, weights_only=False)
 
-        cm = confusion_matrix(golds, preds, labels=list(range(len(classes))))
-        if normalize:
-            cm = cm.astype('float') / (cm.sum(axis=1)[:, np.newaxis] + 1e-12)
 
-        plt.figure(figsize=(10, 8))
-        plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-        plt.title(title)
-        plt.colorbar()
-        tick_marks = np.arange(len(classes))
-        plt.xticks(tick_marks, classes, rotation=45, ha='right')
-        plt.yticks(tick_marks, classes)
+def plot_confusion_matrix(golds: List[int], preds: List[int], classes: List[str], output_dir: str,
+                          title: str = 'Normalized Confusion Matrix', normalize: bool = True):
+    """Vẽ và lưu Confusion Matrix 11x11 ra file PNG."""
+    os.makedirs(output_dir, exist_ok=True)
+    cm = confusion_matrix(golds, preds, labels=list(range(len(classes))))
+    
+    if normalize:
+        cm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+        cm = np.nan_to_num(cm)
 
-        fmt = '.2f' if normalize else 'd'
-        thresh = cm.max() / 2.
-        for i in range(cm.shape[0]):
-            for j in range(cm.shape[1]):
-                plt.text(j, i, format(cm[i, j], fmt),
-                         horizontalalignment="center",
-                         color="white" if cm[i, j] > thresh else "black")
+    plt.figure(figsize=(10, 8))
+    plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    plt.title(title, fontsize=14)
+    plt.colorbar()
+    tick_marks = np.arange(len(classes))
+    plt.xticks(tick_marks, classes, rotation=45, ha='right')
+    plt.yticks(tick_marks, classes)
 
-        plt.ylabel('True label')
-        plt.xlabel('Predicted label')
-        plt.tight_layout()
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            val = format(cm[i, j], fmt) if cm[i, j] > 0 else '0'
+            plt.text(j, i, val,
+                     horizontalalignment="center",
+                     color="white" if cm[i, j] > thresh else "black",
+                     fontsize=8)
 
-        os.makedirs(output_dir, exist_ok=True)
-        save_path = os.path.join(output_dir, 'confusion_matrix.png')
-        plt.savefig(save_path, dpi=300)
-        plt.close()
-    except Exception as e:
-        pass
+    plt.ylabel('True BIO Label', fontsize=12)
+    plt.xlabel('Predicted BIO Label', fontsize=12)
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, 'confusion_matrix.png')
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    return save_path
 

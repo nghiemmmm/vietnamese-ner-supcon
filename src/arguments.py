@@ -1,95 +1,50 @@
 import argparse
+import os
 
 
-def get_stage1_argument():
-    parser = argparse.ArgumentParser(description="Stage 1: Pure Supervised Contrastive Pre-training (Google SupContrast 100%, NO ALPHA)")
-    parser.add_argument("--data_dir", default="Dataset", type=str,
-                        help="The input data dir. Should contain train_data.txt, dev_data.txt, test_data.txt")
-    parser.add_argument("--output_dir", default="outputs/stage1_supcon", type=str,
-                        help="Where to save Stage 1 pre-trained encoder checkpoint")
-    parser.add_argument("--model_name_or_path", default="trungbb8/distilphobert", type=str,
-                        help="Pre-trained PhoBERT model: trungbb8/distilphobert, vinai/phobert-base, vinai/phobert-large")
-    parser.add_argument("--max_seq_length", default=256, type=int,
-                        help="Maximum sequence length")
-    parser.add_argument("--batch_size", default=64, type=int,
-                        help="Batch size for SupCon training")
-    parser.add_argument("--eval_batch_size", default=64, type=int,
-                        help="Batch size for validation")
-    parser.add_argument("--learning_rate", default=2e-5, type=float,
-                        help="Learning rate for PhoBERT backbone in Stage 1")
-    parser.add_argument("--head_learning_rate", default=5e-4, type=float,
-                        help="Learning rate for Projection Head in Stage 1")
-    parser.add_argument("--supcon_temp", default=0.07, type=float,
-                        help="Temperature tau for SupCon loss (default: 0.07)")
-    parser.add_argument("--projection_dim", default=128, type=int,
-                        help="Dimension of contrastive hypersphere representation")
-    parser.add_argument("--epochs", default=15, type=int,
-                        help="Number of epochs for Stage 1")
-    parser.add_argument("--warmup_proportion", default=0.1, type=float,
-                        help="Warmup proportion for linear schedule")
-    parser.add_argument("--weight_decay", default=0.01, type=float,
-                        help="Weight decay")
-    parser.add_argument("--max_grad_norm", default=1.0, type=float,
-                        help="Max gradient norm")
-    parser.add_argument("--early_stop", default=5, type=int,
-                        help="Early stopping patience based on Validation SupCon loss")
-    parser.add_argument("--fp16", action="store_true", default=True,
-                        help="Use mixed precision training (AMP)")
-    parser.add_argument("--no_fp16", dest="fp16", action="store_false")
-    parser.add_argument("--seed", default=42, type=int,
-                        help="Random seed")
-    parser.add_argument("--num_workers", default=2, type=int,
-                        help="DataLoader worker subprocesses")
-    parser.add_argument("--overwrite_data", action="store_true", default=False,
-                        help="Overwrite cached preprocessed datasets")
-    return parser.parse_args()
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Two-Stage Linear Evaluation Protocol: Hierarchical SupCon + Linear Probe (No CRF) for PAP_NER"
+    )
 
+    # 1. Dữ liệu và Mô hình nền tảng
+    parser.add_argument('--task', type=str, default='pap_ner', help="Tên tác vụ (mặc định: pap_ner)")
+    parser.add_argument('--data_dir', type=str, default='./Dataset', help="Thư mục chứa dữ liệu train.txt, dev.txt, test.txt")
+    parser.add_argument('--model_name_or_path', type=str, default='vinai/phobert-base',
+                        help="Tên pretrained checkpoint (vinai/phobert-base hoặc trungbb8/distilphobert)")
+    parser.add_argument('--output_dir', type=str, default='outputs/baseline_hsupcon',
+                        help="Thư mục lưu mô hình và logs kết quả")
+    parser.add_argument('--max_seq_length', type=int, default=256, help="Độ dài chuỗi tối đa")
+    parser.add_argument('--seed', type=int, default=42, help="Random seed tái lập kết quả")
+    parser.add_argument('--fp16', action='store_true', default=True, help="Bật Mixed Precision FP16 (tăng tốc độ, tiết kiệm VRAM)")
+    parser.add_argument('--num_workers', type=int, default=2, help="Số worker nạp dữ liệu")
 
-def get_stage2_argument():
-    parser = argparse.ArgumentParser(description="Stage 2: Linear Probing Evaluation Protocol (Freeze Backbone, Train Linear Classifier, NO CRF)")
-    parser.add_argument("--data_dir", default="Dataset", type=str,
-                        help="The input data dir.")
-    parser.add_argument("--output_dir", default="outputs/stage2_linear", type=str,
-                        help="Where to save Stage 2 Linear Probe model checkpoint")
-    parser.add_argument("--model_name_or_path", default="trungbb8/distilphobert", type=str,
-                        help="Pre-trained PhoBERT model")
-    parser.add_argument("--pretrained_encoder_path", default="outputs/stage1_supcon/best_encoder.pt", type=str,
-                        help="Path to pre-trained encoder from Stage 1 (SupCon)")
-    parser.add_argument("--max_seq_length", default=256, type=int,
-                        help="Maximum sequence length")
-    parser.add_argument("--batch_size", default=64, type=int,
-                        help="Batch size for Linear Probe training")
-    parser.add_argument("--eval_batch_size", default=64, type=int,
-                        help="Batch size for eval")
-    parser.add_argument("--classifier_learning_rate", default=1e-3, type=float,
-                        help="Learning rate for Linear Classifier (default: 1e-3)")
-    parser.add_argument("--epochs", default=20, type=int,
-                        help="Number of epochs for Stage 2")
-    parser.add_argument("--early_stop", default=5, type=int,
-                        help="Early stopping patience based on Validation Strict F1")
-    parser.add_argument("--freeze_backbone", action="store_true", default=True,
-                        help="Strict Linear Evaluation Protocol: Freeze backbone parameters (requires_grad=False)")
-    parser.add_argument("--unfreeze_backbone", dest="freeze_backbone", action="store_false",
-                        help="Optional full fine-tuning mode")
-    parser.add_argument("--fp16", action="store_true", default=True,
-                        help="Use mixed precision (AMP)")
-    parser.add_argument("--no_fp16", dest="fp16", action="store_false")
-    parser.add_argument("--seed", default=42, type=int,
-                        help="Random seed")
-    parser.add_argument("--num_workers", default=2, type=int,
-                        help="DataLoader worker subprocesses")
-    parser.add_argument("--overwrite_data", action="store_true", default=False)
-    return parser.parse_args()
+    # 2. Siêu tham số GIAI ĐOẠN 1: Hierarchical SupCon Pre-training
+    parser.add_argument('--skip_stage1', action='store_true', default=False,
+                        help="Bỏ qua Stage 1 nếu đã có sẵn checkpoint pre-trained encoder")
+    parser.add_argument('--pretrained_encoder_path', type=str, default=None,
+                        help="Đường dẫn file trọng số encoder đã pre-train (nếu bỏ qua Stage 1)")
+    parser.add_argument('--stage1_epochs', type=int, default=15, help="Số epoch tối đa cho Stage 1")
+    parser.add_argument('--stage1_batch_size', type=int, default=64, help="Batch size hiệu dụng cho Stage 1")
+    parser.add_argument('--stage1_lr', type=float, default=2e-5, help="Learning rate của PhoBERT trong Stage 1")
+    parser.add_argument('--stage1_proj_lr', type=float, default=1e-3, help="Learning rate của Projection Head")
+    parser.add_argument('--supcon_temp', type=float, default=0.07, help="Nhiệt độ tau trong hàm tương phản SupCon")
+    parser.add_argument('--supcon_alpha', type=float, default=0.3,
+                        help="Trọng số cầu nối mềm alpha (Weak Positive) giữa B và I của cùng thực thể")
+    parser.add_argument('--proj_dim', type=int, default=128, help="Số chiều không gian chiếu tương phản L2-normalized")
+    parser.add_argument('--stage1_early_stop', type=int, default=5,
+                        help="Dừng sớm sau N epochs nếu Dev SupCon Loss không cải thiện")
 
+    # 3. Siêu tham số GIAI ĐOẠN 2: Linear Probe (Backbone FROZEN, NO CRF)
+    parser.add_argument('--stage2_epochs', type=int, default=20, help="Số epoch cho Stage 2 (Linear Probe)")
+    parser.add_argument('--stage2_batch_size', type=int, default=64, help="Batch size cho Stage 2")
+    parser.add_argument('--stage2_lr', type=float, default=1e-3, help="Learning rate cho tầng Linear Classifier")
+    parser.add_argument('--weight_decay', type=float, default=0.01, help="Hệ số Weight decay L2 regularization")
+    parser.add_argument('--warmup_proportion', type=float, default=0.1, help="Tỷ lệ warmup bước học")
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help="Ngưỡng Gradient Clipping")
+    parser.add_argument('--stage2_early_stop', type=int, default=5,
+                        help="Dừng sớm sau N epochs nếu Dev Strict F1 không cải thiện")
 
-def get_eval_argument():
-    parser = argparse.ArgumentParser(description="Evaluate Stage 2 Linear Probe on Test Set")
-    parser.add_argument("--data_dir", default="Dataset", type=str)
-    parser.add_argument("--model_path", default="outputs/stage2_linear/best_linear_probe.pt", type=str,
-                        help="Path to trained Linear Probe checkpoint")
-    parser.add_argument("--model_name_or_path", default="trungbb8/distilphobert", type=str)
-    parser.add_argument("--batch_size", default=64, type=int)
-    parser.add_argument("--max_seq_length", default=256, type=int)
-    parser.add_argument("--num_workers", default=2, type=int)
-    parser.add_argument("--output_dir", default="outputs/stage2_linear", type=str)
-    return parser.parse_args()
+    args = parser.parse_args()
+    return args
+
